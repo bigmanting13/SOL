@@ -425,7 +425,7 @@ try {
 }
 Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 
-$regFileUrl = "https://pastebin.com/raw/qRaMzabW"
+$regFileUrl = "https://pastebin.com/raw/A9vGEGyT"
 $regFilePath = Join-Path $baseFolder "procexp_config.reg"
 
 try {
