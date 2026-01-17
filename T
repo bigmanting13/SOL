@@ -107,6 +107,8 @@ $memoryIntegrityOutput = @()
 $threatsOutput = @()
 $powershellSigOutput = @()
 
+# ======= FILES + MODULES (AUDIT ONLY – NO DELETIONS) ======= 
+
 $defaultModules = @(
     "Microsoft.PowerShell.Archive", "Microsoft.PowerShell.Diagnostics", "Microsoft.PowerShell.Host",
     "Microsoft.PowerShell.LocalAccounts", "Microsoft.PowerShell.Management", "Microsoft.PowerShell.Security",
@@ -115,16 +117,22 @@ $defaultModules = @(
 
 $protectedModule = "Microsoft.PowerShell.Operation.Validation"
 $modulesPath = "C:\Program Files\WindowsPowerShell\Modules"
-$deletedAny = $false
 $protectedFilePath = "$modulesPath\$protectedModule\1.0.1\Diagnostics\Comprehensive\Comprehensive.Tests.ps1"
 $expectedHash = "99B7CBE4325BA089DD9440A202B9E35D9E6F134A46312F3F1E93E71F23C8DAE3"
 
-Get-ChildItem $modulesPath -ErrorAction SilentlyContinue | Where-Object { $_.PSIsContainer } | ForEach-Object {
+$foundIssues = $false
+
+Get-ChildItem $modulesPath -ErrorAction SilentlyContinue |
+Where-Object { $_.PSIsContainer } |
+ForEach-Object {
     $moduleName = $_.Name
     $modulePath = $_.FullName
     $isDefault = $defaultModules -contains $moduleName
     $isProtected = $moduleName -eq $protectedModule
-    $files = Get-ChildItem $modulePath -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer }
+
+    $files = Get-ChildItem $modulePath -Recurse -Force -ErrorAction SilentlyContinue |
+             Where-Object { -not $_.PSIsContainer }
+
     $unauthorizedFiles = @()
 
     foreach ($file in $files) {
@@ -134,21 +142,20 @@ Get-ChildItem $modulesPath -ErrorAction SilentlyContinue | Where-Object { $_.PSI
         }
     }
 
+    # Non-default modules: REPORT (no delete)
     if (-not $isDefault -and -not $isProtected) {
-        foreach ($file in $files) { try { $file.Attributes = 'Normal' } catch {} }
-        try {
-            Remove-Item $modulePath -Recurse -Force -ErrorAction Stop
-            $modulesOutput += "FAILURE: Removed unauthorized module: $moduleName"
-            $deletedAny = $true
-        } catch {
-            $modulesOutput += "WARNING: Could not delete module '$moduleName'"
-        }
+        $modulesOutput += "FAILURE: Non-default module detected: $moduleName ($modulePath)"
+        $foundIssues = $true
     }
     elseif ($isProtected) {
+        # Protected module: report and (optionally) hash-check the specific file
         if ($unauthorizedFiles.Count -eq 0) {
             $modulesOutput += "SUCCESS: Protected module '$moduleName' verified."
         } else {
             foreach ($file in $unauthorizedFiles) {
+                $modulesOutput += "FAILURE: Unsigned/non-Microsoft file in protected module: '$($file.FullName)'"
+                $foundIssues = $true
+
                 if ($file.FullName -ieq $protectedFilePath) {
                     try {
                         $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
@@ -156,47 +163,46 @@ Get-ChildItem $modulesPath -ErrorAction SilentlyContinue | Where-Object { $_.PSI
                         $actual = $sha256.ComputeHash($bytes)
                         $hash = ([BitConverter]::ToString($actual)).Replace("-", "")
                         if ($hash -ne $expectedHash) {
-                            $modulesOutput += "WARNING: Protected file altered: '$($file.FullName)'"
+                            $modulesOutput += "FAILURE: Protected file altered (hash mismatch): '$($file.FullName)'"
+                            $foundIssues = $true
+                        } else {
+                            $modulesOutput += "SUCCESS: Protected file hash matches expected."
                         }
-                    } catch {}
+                    } catch {
+                        $modulesOutput += "WARNING: Could not hash protected file: '$($file.FullName)'"
+                    }
                 }
             }
             $modulesOutput += "SUCCESS: Protected module intact."
         }
     }
     else {
+        # Default modules: report unauthorized files (no delete)
         foreach ($file in $unauthorizedFiles) {
-            try {
-                $file.Attributes = 'Normal'
-                Remove-Item $file.FullName -Force -ErrorAction Stop
-                $modulesOutput += "FAILURE: Removed unauthorized file: '$($file.FullName)'"
-                $deletedAny = $true
-            } catch {
-                $modulesOutput += "WARNING: Could not delete file '$($file.FullName)'"
-            }
+            $modulesOutput += "FAILURE: Unsigned/non-Microsoft file: '$($file.FullName)'"
+            $foundIssues = $true
         }
+
         if ($unauthorizedFiles.Count -eq 0) {
             $modulesOutput += "SUCCESS: Module '$moduleName' passed signature check."
         }
     }
 }
 
-Get-ChildItem $modulesPath -Force -ErrorAction SilentlyContinue | Where-Object { -not $_.PSIsContainer } | ForEach-Object {
+# Root files directly under Modules folder: REPORT (no delete)
+Get-ChildItem $modulesPath -Force -ErrorAction SilentlyContinue |
+Where-Object { -not $_.PSIsContainer } |
+ForEach-Object {
     $sig = Get-AuthenticodeSignature $_.FullName
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch "Microsoft") {
-        try {
-            Remove-Item $_.FullName -Force
-            $modulesOutput += "FAILURE: Removed unsigned file: '$($_.FullName)'"
-            $deletedAny = $true
-        } catch {
-            $modulesOutput += "WARNING: Could not delete root file '$($_.FullName)'"
-        }
+        $modulesOutput += "FAILURE: Unsigned/non-Microsoft root file: '$($_.FullName)'"
+        $foundIssues = $true
     } else {
         $modulesOutput += "SUCCESS: Root file '$($_.Name)' is signed."
     }
 }
 
-if (-not $deletedAny) {
+if (-not $foundIssues) {
     $modulesOutput += "SUCCESS: No unauthorized modules/files found."
 }
 
