@@ -455,13 +455,10 @@ if (-not $IsAdmin) {
 Clear-Host
 Write-ColoredLine "Step 2 of 3: Process Explorer" White
 Write-Host ""
-Write-Host "========================================" -ForegroundColor Red
-Write-Host "  INSTRUCTION: Wait for Process Explorer" -ForegroundColor Red
-Write-Host "  to open. Scroll to the bottom, then   " -ForegroundColor Red
-Write-Host "  press Enter.                           " -ForegroundColor Red
-Write-Host "                                        " -ForegroundColor Red
-Write-Host "  *** DO NOT CLOSE PROCESS EXPLORER ***  " -ForegroundColor Yellow
-Write-Host "========================================" -ForegroundColor Red
+Write-Host "====================================================================================================================================" -ForegroundColor Red
+Write-Host "  INSTRUCTION: Wait for Process Explorer to open. Scroll down and back up. Then return to the Powershell to continue the final step." -ForegroundColor Red
+Write-Host "                                              *** DO NOT CLOSE PROCESS EXPLORER ***  " -ForegroundColor Yellow
+Write-Host "====================================================================================================================================" -ForegroundColor Red
 Write-Host ""
 Show-LoadingBar
 
