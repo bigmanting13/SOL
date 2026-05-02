@@ -9,6 +9,72 @@ if (-not $IsAdmin) {
     exit 1
 }
 
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class Mem {
+    [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+    [DllImport("kernel32.dll")] public static extern bool ReadProcessMemory(IntPtr hProc, IntPtr addr, byte[] buf, int size, out int read);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetModuleHandle(string name);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetProcAddress(IntPtr hMod, string proc);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+}
+'@
+
+function Get-PrologueBytes {
+    param([int]$TargetPid)
+    $funcAddr = [Mem]::GetProcAddress([Mem]::GetModuleHandle("ntdll.dll"), "NtQuerySystemInformation")
+    if ($funcAddr -eq [IntPtr]::Zero) { return @{ Ok = $false; Reason = "funcaddr" } }
+    $handle = [Mem]::OpenProcess(0x0010, $false, $TargetPid)
+    if ($handle -eq [IntPtr]::Zero) { return @{ Ok = $false; Reason = "openprocess" } }
+    $buf     = New-Object byte[] 8
+    $read    = 0
+    $success = [Mem]::ReadProcessMemory($handle, $funcAddr, $buf, 8, [ref]$read)
+    [Mem]::CloseHandle($handle) | Out-Null
+    if (-not $success -or $read -eq 0) { return @{ Ok = $false; Reason = "readmem" } }
+    return @{ Ok = $true; Bytes = $buf }
+}
+
+function Is-Hooked {
+    param([byte[]]$Bytes)
+    if ($Bytes[0] -eq 0xE9)                                                    { return $true }
+    if ($Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0x25)                           { return $true }
+    if ($Bytes[0] -eq 0xCC)                                                    { return $true }
+    if ($Bytes[0] -eq 0xEB)                                                    { return $true }
+    if ($Bytes[0] -eq 0x4C -and $Bytes[1] -eq 0x8B -and $Bytes[2] -eq 0xD1)  { return $false }
+    return $true
+}
+
+function Check-ProcessHook {
+    param(
+        [string]$Label,
+        [System.Diagnostics.Process]$Proc,
+        [hashtable]$SelfResult
+    )
+    $result = Get-PrologueBytes -TargetPid $Proc.Id
+    if (-not $result.Ok) { return $false }
+    $hooked   = Is-Hooked -Bytes $result.Bytes
+    $mismatch = $false
+    if ($SelfResult.Ok) {
+        for ($i = 0; $i -lt 8; $i++) {
+            if ($result.Bytes[$i] -ne $SelfResult.Bytes[$i]) { $mismatch = $true; break }
+        }
+    }
+    return (-not $hooked -and -not $mismatch)
+}
+
+function Find-ProcessExplorer {
+    $names = @("procexp64", "procexp", "procexp64a", "procexp_x64", "ProcessExplorer")
+    foreach ($n in $names) {
+        $p = Get-Process -Name $n -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($p) { return $p }
+    }
+    $all = Get-Process | Where-Object {
+        try { $_.MainWindowTitle -like "*Process Explorer*" } catch { $false }
+    } | Select-Object -First 1
+    return $all
+}
+
 function Write-ColoredLine {
     param (
         [string]$Text,
@@ -35,57 +101,6 @@ function Wait-ForEnter {
     }
 }
 
-Clear-Host
-Write-ColoredLine ""
-Write-ColoredLine "=== SOL Recording Policy ===" Yellow
-Write-ColoredLine "Complete both steps with 100% success to pass." White
-Write-ColoredLine "If a prompt shows up, press OK to run the application." White
-Write-ColoredLine "Follow the instructions listed on each step." White
-Write-ColoredLine "This PowerShell policy currently has 2 steps." White
-Write-Host ""
-$cpu = Get-WmiObject Win32_Processor | Select-Object -First 1
-
-if ($cpu.NumberOfCores -ge 4 -and $cpu.MaxClockSpeed -ge 2500) {
-    Write-Host "Detected CPU: $($cpu.Name)" -ForegroundColor Green
-    Write-Host "Your CPU looks good." -ForegroundColor Green 
-} else {
-    Write-Host "Detected CPU: $($cpu.Name)" -ForegroundColor Red
-    Write-Host "Your CPU may be a bit weak. This process may take longer for you." -ForegroundColor Yellow
-}
-
-Write-Host ""
- 
-$gpu = Get-WmiObject Win32_VideoController | Select-Object -First 1
-$gpuName = $gpu.Name
-
-# Define "good" GPU keywords (can expand as needed)
-$goodGPUs = @("RTX 30", "RTX 40", "RX 6000", "RX 7000")
-
-$gpuIsGood = $false
-foreach ($keyword in $goodGPUs) {
-    if ($gpuName -like "*$keyword*") { $gpuIsGood = $true; break }
-}
-
-if ($gpuIsGood) {
-    Write-Host "Detected GPU: $gpuName" -ForegroundColor Green
-    Write-Host "Your GPU looks good." -ForegroundColor Green 
-} else {
-    Write-Host "Detected GPU: $gpuName" -ForegroundColor Red
-    Write-Host "Your GPU may be a bit weak. Some processes may be slower." -ForegroundColor Yellow
-}
-Write-ColoredLine "=== Credits ===" Yellow
-Write-ColoredLine "Made by SOL" White
-Write-Host ""
-Wait-ForEnter -Message "Press Enter to Continue"
-Clear-Host
-
-# ====== STEP 1: SYSTEM CHECK ====== 
-
-Write-ColoredLine "Step 1 of 2: SYSTEM Check" White
-Write-ColoredLine "INSTRUCTION: Reach 100% success" Yellow
-
-Write-Host ""
-
 function Show-LoadingBar {
     for ($i = 0; $i -le 10; $i++) {
         $percent = $i * 10
@@ -97,6 +112,67 @@ function Show-LoadingBar {
     Write-Host ""
 }
 
+function Write-Section {
+    param([string]$Title, [string[]]$Lines)
+    Write-Host "--- $Title ---" -ForegroundColor White
+    foreach ($line in $Lines) {
+        if ($line -match "^SUCCESS") { Write-Host $line -ForegroundColor Green }
+        elseif ($line -match "^FAILURE") { Write-Host $line -ForegroundColor Red }
+        elseif ($line -match "^WARNING") { Write-Host $line -ForegroundColor Yellow }
+        else { Write-Host $line -ForegroundColor White }
+    }
+}
+
+Clear-Host
+Write-ColoredLine ""
+Write-ColoredLine "=== SOL Recording Policy ===" Yellow
+Write-ColoredLine "Complete both steps with 100% success to pass." White
+Write-ColoredLine "If a prompt shows up, press OK to run the application." White
+Write-ColoredLine "Follow the instructions listed on each step." White
+Write-ColoredLine "This PowerShell policy currently has 3 steps." White
+Write-Host ""
+
+$cpu = Get-WmiObject Win32_Processor | Select-Object -First 1
+
+if ($cpu.NumberOfCores -ge 4 -and $cpu.MaxClockSpeed -ge 2500) {
+    Write-Host "Detected CPU: $($cpu.Name)" -ForegroundColor Green
+    Write-Host "Your CPU looks good." -ForegroundColor Green
+} else {
+    Write-Host "Detected CPU: $($cpu.Name)" -ForegroundColor Red
+    Write-Host "Your CPU may be a bit weak. This process may take longer for you." -ForegroundColor Yellow
+}
+
+Write-Host ""
+
+$gpu = Get-WmiObject Win32_VideoController | Select-Object -First 1
+$gpuName = $gpu.Name
+
+$goodGPUs = @("RTX 30", "RTX 40", "RX 6000", "RX 7000")
+
+$gpuIsGood = $false
+foreach ($keyword in $goodGPUs) {
+    if ($gpuName -like "*$keyword*") { $gpuIsGood = $true; break }
+}
+
+if ($gpuIsGood) {
+    Write-Host "Detected GPU: $gpuName" -ForegroundColor Green
+    Write-Host "Your GPU looks good." -ForegroundColor Green
+} else {
+    Write-Host "Detected GPU: $gpuName" -ForegroundColor Red
+    Write-Host "Your GPU may be a bit weak. Some processes may be slower." -ForegroundColor Yellow
+}
+
+Write-ColoredLine "=== Credits ===" Yellow
+Write-ColoredLine "Made by SOL" White
+Write-Host ""
+
+Wait-ForEnter -Message "Press Enter to Continue"
+Clear-Host
+
+Write-ColoredLine "Step 1 of 3: SYSTEM Check" White
+Write-ColoredLine "INSTRUCTION: Reach 100% success" Yellow
+Write-Host ""
+
 Show-LoadingBar
 
 $exclusionsOutput = @()
@@ -106,8 +182,7 @@ $windowsOutput = @()
 $memoryIntegrityOutput = @()
 $threatsOutput = @()
 $powershellSigOutput = @()
-
-# ======= FILES + MODULES (AUDIT ONLY – NO DELETIONS) ======= 
+$shortcutHotkeyOutput = @()
 
 $defaultModules = @(
     "Microsoft.PowerShell.Archive", "Microsoft.PowerShell.Diagnostics", "Microsoft.PowerShell.Host",
@@ -142,13 +217,11 @@ ForEach-Object {
         }
     }
 
-    # Non-default modules: REPORT (no delete)
     if (-not $isDefault -and -not $isProtected) {
         $modulesOutput += "FAILURE: Non-default module detected: $moduleName ($modulePath)"
         $foundIssues = $true
     }
     elseif ($isProtected) {
-        # Protected module: report and (optionally) hash-check the specific file
         if ($unauthorizedFiles.Count -eq 0) {
             $modulesOutput += "SUCCESS: Protected module '$moduleName' verified."
         } else {
@@ -177,7 +250,6 @@ ForEach-Object {
         }
     }
     else {
-        # Default modules: report unauthorized files (no delete)
         foreach ($file in $unauthorizedFiles) {
             $modulesOutput += "FAILURE: Unsigned/non-Microsoft file: '$($file.FullName)'"
             $foundIssues = $true
@@ -189,7 +261,6 @@ ForEach-Object {
     }
 }
 
-# Root files directly under Modules folder: REPORT (no delete)
 Get-ChildItem $modulesPath -Force -ErrorAction SilentlyContinue |
 Where-Object { -not $_.PSIsContainer } |
 ForEach-Object {
@@ -288,15 +359,59 @@ try {
     $powershellSigOutput += "WARNING: Could not verify PowerShell binary."
 }
 
-function Write-Section {
-    param([string]$Title, [string[]]$Lines)
-    Write-Host "--- $Title ---" -ForegroundColor White
-    foreach ($line in $Lines) {
-        if ($line -match "^SUCCESS") { Write-Host $line -ForegroundColor Green }
-        elseif ($line -match "^FAILURE") { Write-Host $line -ForegroundColor Red }
-        elseif ($line -match "^WARNING") { Write-Host $line -ForegroundColor Yellow }
-        else { Write-Host $line -ForegroundColor White }
+try {
+    $shortcutPaths = @(
+        "$env:USERPROFILE\Desktop",
+        "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+        "$env:ProgramData\Microsoft\Windows\Start Menu\Programs"
+    )
+
+    $wsh = New-Object -ComObject WScript.Shell
+    $foundHotkeys = $false
+
+    Get-ChildItem -Path $shortcutPaths -Filter *.lnk -Recurse -ErrorAction SilentlyContinue |
+    ForEach-Object {
+        $s = $wsh.CreateShortcut($_.FullName)
+
+        if ($s.Hotkey) {
+            $foundHotkeys = $true
+            $target = $s.TargetPath
+            $sigStatus = "N/A"
+            $isVerified = $false
+            $signer = $null
+
+            if ($target -and (Test-Path $target) -and ([System.IO.Path]::GetExtension($target) -ieq ".exe")) {
+                try {
+                    $sig = Get-AuthenticodeSignature -FilePath $target
+                    $sigStatus = $sig.Status
+                    $isVerified = ($sig.Status -eq 'Valid')
+                    if ($sig.SignerCertificate) {
+                        $signer = $sig.SignerCertificate.Subject
+                    }
+                } catch {
+                    $sigStatus = "Error"
+                }
+            } elseif (-not $target) {
+                $sigStatus = "NoTarget"
+            } elseif (-not (Test-Path $target)) {
+                $sigStatus = "MissingTarget"
+            } else {
+                $sigStatus = "NonExeTarget"
+            }
+
+            if ($isVerified) {
+                $shortcutHotkeyOutput += "SUCCESS: Hotkey shortcut '$($_.Name)' | Hotkey=$($s.Hotkey) | Verified=True | Status=$sigStatus | Target=$target"
+            } else {
+                $shortcutHotkeyOutput += "FAILURE: Hotkey shortcut '$($_.Name)' | Hotkey=$($s.Hotkey) | Verified=False | Status=$sigStatus | Target=$target"
+            }
+        }
     }
+
+    if (-not $foundHotkeys) {
+        $shortcutHotkeyOutput += "SUCCESS: No shortcut hotkeys found in monitored paths."
+    }
+} catch {
+    $shortcutHotkeyOutput += "WARNING: Could not audit shortcut hotkeys: $($_.Exception.Message)"
 }
 
 Write-Section "Files + Modules" $modulesOutput
@@ -306,8 +421,9 @@ Write-Section "Windows Defender" $defenderOutput
 Write-Section "Exclusions" $exclusionsOutput
 Write-Section "Threats" $threatsOutput
 Write-Section "Binary Sig" $powershellSigOutput
+Write-Section "Shortcut Hotkeys" $shortcutHotkeyOutput
 
-$allResults = $modulesOutput + $windowsOutput + $memoryIntegrityOutput + $defenderOutput + $exclusionsOutput + $threatsOutput + $powershellSigOutput
+$allResults = $modulesOutput + $windowsOutput + $memoryIntegrityOutput + $defenderOutput + $exclusionsOutput + $threatsOutput + $powershellSigOutput + $shortcutHotkeyOutput
 $total = ($allResults | Where-Object { $_ -match '^(SUCCESS|FAILURE|WARNING)' }).Count
 $success = ($allResults | Where-Object { $_ -match '^SUCCESS' }).Count
 $rate = if ($total -gt 0) { [math]::Round(($success / $total) * 100, 0) } else { 0 }
@@ -318,31 +434,6 @@ Write-Host ("Success Rate: $rate% ($success / $total)") -ForegroundColor $rateCo
 
 Wait-ForEnter -Message "Press Enter to Continue"
 Clear-Host
-
-# ====== STEP 2: PROCESS EXPLORER ======
-
-function Write-ColoredLine {
-    param (
-        [string]$Text,
-        [ConsoleColor]$Color = 'White'
-    )
-    $oldColor = $Host.UI.RawUI.ForegroundColor
-    $Host.UI.RawUI.ForegroundColor = $Color
-    Write-Host $Text
-    $Host.UI.RawUI.ForegroundColor = $oldColor
-}
-
-function Wait-ForEnter {
-    Start-Sleep -Seconds 1
-    Write-ColoredLine "Press Enter to exit." Yellow
-    while ($true) {
-        if ([System.Console]::KeyAvailable) {
-            $key = [System.Console]::ReadKey($true)
-            if ($key.Key -eq "Enter") { break }
-        }
-        Start-Sleep -Milliseconds 100
-    }
-}
 
 $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -362,8 +453,15 @@ if (-not $IsAdmin) {
 }
 
 Clear-Host
-Write-ColoredLine "Step 2 of 2: Process Explorer" White
-Write-ColoredLine "INSTRUCTION: Wait for Process Explorer to open. Scroll to the bottom, then close the window." Yellow
+Write-ColoredLine "Step 2 of 3: Process Explorer" White
+Write-Host ""
+Write-Host "========================================" -ForegroundColor Red
+Write-Host "  INSTRUCTION: Wait for Process Explorer" -ForegroundColor Red
+Write-Host "  to open. Scroll to the bottom, then   " -ForegroundColor Red
+Write-Host "  press Enter.                           " -ForegroundColor Red
+Write-Host "                                        " -ForegroundColor Red
+Write-Host "  *** DO NOT CLOSE PROCESS EXPLORER ***  " -ForegroundColor Yellow
+Write-Host "========================================" -ForegroundColor Red
 Write-Host ""
 Show-LoadingBar
 
@@ -375,9 +473,9 @@ if ($runningPE) {
     $runningPE | ForEach-Object {
         try {
             $_ | Stop-Process -Force -ErrorAction Stop
-            Write-ColoredLine "[SUCCESS]  • Terminated process ID $($_.Id)." Green
+            Write-ColoredLine "[SUCCESS]  - Terminated process ID $($_.Id)." Green
         } catch {
-            Write-ColoredLine "[FAILED]  • Failed to terminate process ID $($_.Id): $($_.Exception.Message)" Red
+            Write-ColoredLine "[FAILED]  - Failed to terminate process ID $($_.Id): $($_.Exception.Message)" Red
         }
     }
     Start-Sleep -Seconds 2
@@ -476,11 +574,47 @@ if ($actualExe) {
     Write-ColoredLine "[SUCCESS] Process Explorer launched successfully." Green
     Write-Host ""
 
-    $process.WaitForExit()
     Write-ColoredLine "[SUCCESS] Success Rate: 100% (1 / 1)." Green
 } else {
     Write-ColoredLine "[FAILED] procexp64.exe was not found." Red
     Write-ColoredLine "[SUCCESS] Success Rate: 0% (0 / 1)." Red
+}
+
+Wait-ForEnter -Message "Press Enter to Continue"
+Clear-Host
+
+Clear-Host
+Write-ColoredLine "Step 3 of 3: Tamper Check" White
+Write-ColoredLine "INSTRUCTION: Press Enter to run the check." Yellow
+Write-Host ""
+Wait-ForEnter -Message "Press Enter to begin check"
+Write-Host ""
+Show-LoadingBar
+
+$selfPid    = [System.Diagnostics.Process]::GetCurrentProcess().Id
+$selfResult = Get-PrologueBytes -TargetPid $selfPid
+
+$step3Pass = $true
+
+$pe = Find-ProcessExplorer
+if (-not $pe) {
+    Write-Host "FAILURE: Process Explorer is not open. Open it and re-run this step." -ForegroundColor Red
+    $step3Pass = $false
+} else {
+    $peClean = Check-ProcessHook -Label "Process Explorer" -Proc $pe -SelfResult $selfResult
+    if ($peClean) {
+        Write-Host "SUCCESS: Process Explorer is clean." -ForegroundColor Green
+    } else {
+        Write-Host "FAILURE: Process Explorer has been tampered with." -ForegroundColor Red
+        $step3Pass = $false
+    }
+}
+
+Write-Host ""
+if ($step3Pass) {
+    Write-Host "Success Rate: 100% (1 / 1)" -ForegroundColor Green
+} else {
+    Write-Host "Success Rate: 0% (0 / 1)" -ForegroundColor Red
 }
 
 Wait-ForEnter
